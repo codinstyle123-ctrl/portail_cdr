@@ -2793,81 +2793,75 @@ class AuditDoublonsIPUploadView(APIView):
 #             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+
+
 class AuditDoublonsIPView(APIView):
     """
     API view to return the latest audit date and coherence rate.
-    Handles empty tables safely.
     """
 
-    def get_latest_date(self, architecture=None):
+    def get_latest_date(self):
         """
-        Get the latest insertion date, optionally filtered by architecture.
-        Returns None if no records exist.
+        Return the most recent insertion_date across all AuditDoublonsIP rows, or None.
         """
-        qs = AuditDoublonsIP.objects.all()
-        if architecture:
-            qs = qs.filter(architecture=architecture)
+        return (
+            AuditDoublonsIP.objects
+            .exclude(insertion_date__isnull=True)
+            .order_by("-insertion_date")
+            .values_list("insertion_date", flat=True)
+            .first()
+        )
 
-        latest_record = qs.exclude(insertion_date__isnull=True).order_by('-insertion_date').values('insertion_date').first()
-        if not latest_record:
-            return None
-
-        return latest_record['insertion_date']
-
-
-    def taux_de_coherence(self, architecture=None):
+    def taux_de_coherence(self):
         """
-        Calculate taux de coherence:
-        (rows with 'Unique dans BDE TRANS' in K + rows with 'pas de doublons' in L)
-        divided by total rows.
+        Calculate the coherence rate for the latest insertion date.
+
+        - Numerator: rows where doublons_dans_bde_trans = "Unique dans BDE TRANS"
+          OR doublons_dans_bde_radio = "pas de doublons".
+        - Denominator: total rows for that insertion date.
+        Returns both the percentage and the raw counts.
         """
-        latest_date = self.get_latest_date(architecture)
+        latest_date = self.get_latest_date()
         if not latest_date:
-            return {'percentage': 0, 'total_records': 0, 'bde_trans_numerator': 0}
+            return {"percentage": 0, "total_records": 0, "numerator": 0}
 
-        # Base queryset
         qs = AuditDoublonsIP.objects.filter(insertion_date=latest_date)
-        if architecture:
-            qs = qs.filter(architecture=architecture)
-
         total_records = qs.count()
 
-        # Numerator: rows that match either condition
         numerator = qs.filter(
-            Q(doublons_bde_trans="Unique dans BDE TRANS") |
-            Q(doublons_bde_radio="pas de doublons")
+            Q(doublons_dans_bde_trans="Unique dans BDE TRANS") |
+            Q(doublons_dans_bde_radio="pas de doublons")
         ).count()
 
-        percentage = round((numerator / total_records) * 100) if total_records else 0
+        percentage = round((numerator / total_records) * 100, 2) if total_records else 0.0
 
         return {
             "percentage": percentage,
             "total_records": total_records,
-            "doublons_ip_count": bde_trans_numerator,  # alias
+            "numerator": numerator,
         }
 
+    def get(self, request, *args, **kwargs):
+        """
+        Return the latest insertion date and the coherence rate.
+        """
+        latest_date = self.get_latest_date()
+        if not latest_date:
+            return Response(
+                {"latest_date": None, "message": "No records found for IP"},
+                status=status.HTTP_200_OK,
+            )
 
+        taux = self.taux_de_coherence()
+        # If you also want to expose the tolerance as a fraction (0–1), you can include it:
+        taux["tolerance"] = (
+            taux["numerator"] / taux["total_records"] if taux["total_records"] else 0.0
+        )
 
-    def get(self, request, format=None):
-        try:
-            architecture = request.query_params.get('architecture', None)
-
-            latest_date = self.get_latest_date(architecture)
-            if not latest_date:
-                return Response({
-                    "latest_date": None,
-                    "message": "No records found for IP"
-                }, status=status.HTTP_200_OK)
-
-            taux_de_coherence = self.taux_de_coherence(architecture)
-
-            response_data = {
-                'latest_date': latest_date,
-                'taux_de_coherence': taux_de_coherence,
-            }
-
-            return Response(response_data, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            # Log the exception in production for debugging
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            {
+                "latest_date": latest_date,
+                "taux_de_coherence": taux,
+            },
+            status=status.HTTP_200_OK,
+        )
