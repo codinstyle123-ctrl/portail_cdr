@@ -1,0 +1,16 @@
+/* customStyles.css */
+.customArchitectureSelector .MuiInputLabel-root {
+  color: white !important;
+}
+
+.customArchitectureSelector .MuiSelect-select {
+  color: white !important;
+}
+
+.customArchitectureSelector .MuiOutlinedInput-notchedOutline {
+  border-color: white !important;
+}
+
+.customArchitectureSelector .MuiSvgIcon-root {
+  color: white !important;
+}
