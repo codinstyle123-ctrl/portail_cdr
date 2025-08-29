@@ -1,0 +1,580 @@
+from django.views.generic import View
+from django.shortcuts import HttpResponse
+from django.http import JsonResponse
+from .forms import FluxoaForm, CellDataSfrForm
+from .models import Fluxoa,CellDataSfr,CellDataDci
+from django.core.exceptions import ObjectDoesNotExist
+import pandas as pd
+from django.middleware.csrf import get_token
+from datetime import datetime
+from django.db.models import Count,Q
+from django.db import DatabaseError
+from django.db.models.functions import TruncDate,TruncWeek
+from datetime import datetime, timedelta
+from django.utils import timezone
+from django.core.mail import send_mail
+import tempfile
+class UploadExcelView(View):
+  def post(self, request):
+    form = FluxoaForm(request.POST, request.FILES)
+    try:
+        synthese_file = request.FILES.get('synthese.xlsx')
+        remontedci_file= request.FILES.get('DCI_Remonte.xlsx')
+        remontesfr_file= request.FILES.get('SFR_Remonte.xlsx')
+        resultsbytel_file=  request.FILES.get('resultsbytel.xlsx')
+        resultssfr_file = request.FILES.get('resultssfr.xlsx')
+        df = pd.read_excel(synthese_file)
+        df_dci = pd.read_excel(remontedci_file, sheet_name='D0')
+        print(df_dci.columns)
+        df_sfr= pd.read_excel(remontesfr_file,sheet_name='D0')
+        df_resultsbytel=pd.read_excel(resultsbytel_file,sheet_name='Sheet1')
+        df_resultssfr=pd.read_excel(resultssfr_file,sheet_name='Sheet1')
+        _, path_resultsbytel = tempfile.mkstemp(suffix='.xlsx')
+        _, path_resultssfr = tempfile.mkstemp(suffix='.xlsx')
+        df_resultsbytel.to_excel(path_resultsbytel)
+        df_resultssfr.to_excel(path_resultssfr)
+        request.session['path_resultsbytel'] = path_resultsbytel
+        request.session['path_resultssfr'] = path_resultssfr
+        if df['DATE'].dtype == 'O':  # 'O' stands for object, which means it's likely a string
+                df['DATE'] = pd.to_datetime(df['DATE'], dayfirst=True, errors='coerce')
+        # Extract date from the first row
+        first_row_date = df.iloc[0]['DATE'].date()
+
+        # Check if any records with the same week date exist in the database
+        existing_dates = Fluxoa.objects.filter(
+            DATE__range=[
+                first_row_date - timedelta(days=first_row_date.weekday()),
+                first_row_date + timedelta(days=6 - first_row_date.weekday())
+            ]
+        ).exists()
+
+        if existing_dates:
+            return JsonResponse({'success': False, 'error': 'A date in the same week already exists in the database.'}, status=400)
+        CellDataDci.objects.all().delete()
+        CellDataSfr.objects.all().delete()
+        # Proceed with inserting all records from the Excel file
+        for index, row in df.iterrows():
+            try:
+                obj = Fluxoa.objects.create(
+                    ID_CELL=row['ID_CELL'],
+                    ETAT_EXPLOITATION_CRS=row['ETAT_EXPLOITATION_CRS'],
+                    PRESENCE=row['PRESENCE'],
+                    STATUS=row['status'],
+                    PRESENCE_TABLE=row['PRESENCE-table'],
+                    DATE=row['DATE'].date()  # Ensure DATE field is in the correct format
+                )
+                print(f"Object created with ID: {obj.pk}")
+            except Exception as e:
+                print(f"Error creating object: {e}")
+                return JsonResponse({'success': False, 'error': 'Error creating object: ' + str(e)}, status=500)
+        print(df_dci.columns)
+        for index, row in df_dci.iterrows():
+            try:
+                obj = CellDataDci.objects.create(
+    Cell_State_BDE=row['Cell_State_BDE'],
+    Cell_State_BDR=row['Cell_State_BDR'],
+    CellState_Commentaire=row['CellState_Commentaire'],
+    CellName=row['CellName'],
+    CELLNAME_BDE=row['CELLNAME_BDE'],
+    CODE_ACQUITTEMENT=row['CODE_ACQUITTEMENT'],
+    CODE_FICHIER=row['CODE_FICHIER'],
+    Constructeur=row['Constructeur'],
+    ETAT_EXPLOITATION_CRS=row['ETAT_EXPLOITATION_CRS'],
+    ETAT_EXPLOITATION_CRS_R=row['ETAT_EXPLOITATION_CRS_R'],
+    ID_CELL=row['ID_CELL'],
+    ID_CELL_cible=row['ID_CELL_cible'],
+    PRESENCE=row['PRESENCE'],
+    NOM_FICHIER=row['NOM_FICHIER'],
+    Site_Logique=row['Site_Logique'],
+    TECHNO=row['TECHNO'],
+    Site_Theorique=row['Site_Theorique'],
+    TYPE_OBJET=row['TYPE_OBJET'],
+    ZONE_NOK=row['ZONE_NOK'],
+)
+                print(f"Object created with ID: {obj.pk}")
+            except Exception as e:
+                print(f"Error creating object: {e}")
+                return JsonResponse({'success': False, 'error': 'Error creating object: ' + str(e)}, status=500)
+        for index, row in df_sfr.iterrows():
+            try:
+                obj = CellDataSfr.objects.create(
+                    CODE=str(row['CODE_ACQUITTEMENT']),
+                    CODE_FICHIER=str(row['CODE_FICHIER']),
+                    IDcell=str(row['IDcell']),
+                    NOM_FICHIER=str(row['NOM_FICHIER']),
+                    ID_CELL_cible=str(row['ID_CELL_cible']),
+                    TYPE_OBJET=str(row['TYPE_OBJET']),
+                    TECHNO=str(row['TECHNO']),
+                    ZONE_NOK=str(row['ZONE_NOK'])
+                )
+                print(f"Object created with ID: {obj.pk}")
+            except Exception as e:
+                print(f"Error creating object: {e}")
+                return JsonResponse({'success': False, 'error': 'Error creating object: ' + str(e)}, status=500)  
+        return JsonResponse({'success': True, 'message': 'Data successfully inserted into the database'})
+    except Exception as e:
+        print(f"Error processing Excel file: {str(e)}")
+        return JsonResponse({'success': False, 'error': 'Error processing Excel file: ' + str(e)}, status=500)
+
+
+
+class GetCsrfTokenView(View):
+    def get(self, request, *args, **kwargs):
+        csrf_token = get_token(request)
+        return JsonResponse({'csrf_token': csrf_token})
+
+
+class GroupByDateAndStatusView(View):
+    def get(self, request, *args, **kwargs):
+        try:
+            today = datetime.now().date()
+            start_of_current_week = today - timedelta(days=today.weekday())
+            start_of_previous_week = start_of_current_week - timedelta(days=7)
+
+            
+            data = (
+                Fluxoa.objects
+                .filter(STATUS__in=['cellule normale', 'Cellule en RR ou BDR uniquement','Demonte mais present dans BDE'])
+                .annotate(week=TruncWeek('DATE'))
+                .filter(week__in=[start_of_current_week, start_of_previous_week])
+                .values('week', 'STATUS')
+                .annotate(count=Count('ID'))
+                .order_by('week')
+            )
+
+            result_data = {}
+            for entry in data:
+                week_start = entry['week'].strftime('%Y-%m-%d')
+                status = entry['STATUS']
+                count = entry['count']
+
+
+                if week_start not in result_data:
+                    result_data[week_start] = {}
+
+                result_data[week_start][status] = count
+
+            return JsonResponse({'success': True, **result_data})
+        except Exception as e:
+            print(f"Error grouping by week and filtering by status: {str(e)}")
+            return JsonResponse({'success': False, 'error': str(e)})
+
+
+class TableDataView(View):
+    def get(self, request, *args, **kwargs):
+        try:
+            today = datetime.now().date()
+            start_of_current_week = today - timedelta(days=today.weekday())
+            start_of_previous_week = start_of_current_week - timedelta(days=7)
+
+            data = (
+                Fluxoa.objects
+                .filter(
+                    Q(STATUS='cellule normale', ETAT_EXPLOITATION_CRS='En exploitation') |
+                    Q(STATUS='cellule normale', ETAT_EXPLOITATION_CRS='Demonte') |
+                    Q(STATUS='cellule normale', ETAT_EXPLOITATION_CRS='Non exploite') |
+                    Q(STATUS='Cellule en RR ou BDR uniquement', ETAT_EXPLOITATION_CRS='Non exploite') |
+                    Q(STATUS='Cellule en RR ou BDR uniquement', ETAT_EXPLOITATION_CRS='En exploitation') |
+                    Q(STATUS='Cellule en RR ou BDR uniquement', ETAT_EXPLOITATION_CRS='Demonte') |
+                    Q(STATUS='Demonte mais present dans BDE', ETAT_EXPLOITATION_CRS='En exploitation') |
+                    Q(STATUS='Demonte mais present dans BDE', ETAT_EXPLOITATION_CRS='Demonte') |
+                    Q(STATUS='Demonte mais present dans BDE', ETAT_EXPLOITATION_CRS='Non exploite')
+                )
+                .annotate(week=TruncWeek('DATE'))
+                .filter(week__in=[start_of_current_week, start_of_previous_week])
+                .values('week', 'STATUS', 'ETAT_EXPLOITATION_CRS')
+                .annotate(count=Count('ID'))
+                .order_by('week')
+            )
+
+            result_data = {}
+            for entry in data:
+                week_start = entry['week'].strftime('%Y-%m-%d')
+                status = entry['STATUS']
+                etat_exploitation_crs = entry['ETAT_EXPLOITATION_CRS']
+                count = entry['count']
+
+                if week_start not in result_data:
+                    result_data[week_start] = {}
+
+                if status not in result_data[week_start]:
+                    result_data[week_start][status] = {}
+
+                result_data[week_start][status][etat_exploitation_crs] = count
+
+            # Include keys with count 0 for missing combinations
+            possible_combinations = [
+                ('cellule normale', 'En exploitation'),
+                ('cellule normale', 'Demonte'),
+                ('cellule normale', 'Non exploite'),
+                ('Cellule en RR ou BDR uniquement', 'Non exploite'),
+                ('Cellule en RR ou BDR uniquement', 'En exploitation'),
+                ('Cellule en RR ou BDR uniquement', 'Demonte'),
+                ('Demonte mais present dans BDE', 'En exploitation'),
+                ('Demonte mais present dans BDE', 'Demonte'),
+                ('Demonte mais present dans BDE', 'Non exploite')
+            ]
+
+            for week_data in result_data.values():
+                for status, etat_exploitation_crs in possible_combinations:
+                    if status not in week_data:
+                        week_data[status] = {}
+                    if etat_exploitation_crs not in week_data[status]:
+                        week_data[status][etat_exploitation_crs] = 0
+
+            return JsonResponse({'success': True, 'data': result_data})
+        except Exception as e:
+            print(f"Error grouping by week and filtering by status: {str(e)}")
+            return JsonResponse({'success': False, 'error': str(e)})
+
+................
+class RecordCountView(View):
+    def get(self, request, *args, **kwargs):
+        code_values = ['D01', 'D02', 'D03', 'D04', 'D05', 'D06']
+        response_data = {}
+
+        try:
+            for code in code_values:
+                sfr_count = CellDataSfr.objects.filter(CODE=code).count()
+                dci_count = CellDataDci.objects.filter(CODE_ACQUITTEMENT=code).count()
+
+                response_data[f'{code}_count_sfr'] = sfr_count
+                response_data[f'{code}_count_dci'] = dci_count
+
+            return JsonResponse(response_data)
+
+        except DatabaseError as e:
+            error_message = str(e)
+            return JsonResponse({'error': error_message}, status=500)
+
+        except Exception as e:
+            error_message = str(e)
+            return JsonResponse({'error': error_message}, status=500)
+    def post(self, request, *args, **kwargs):
+        try:
+            response_data = self.get_response_data()
+
+            path_resultsbytel = request.session.get('path_resultsbytel', None)
+            path_resultssfr = request.session.get('path_resultssfr', None)
+
+            if path_resultsbytel and path_resultssfr:
+                df_resultsbytel = pd.read_excel(path_resultsbytel)
+                df_resultssfr = pd.read_excel(path_resultssfr)
+
+                resultbytel_response = self.analyze_d00_to_d06_czran_oal_all_bytel(df_resultsbytel)
+                resultsfr_response = self.analyze_d00_to_d06_czran_oal_all_sfr(df_resultssfr)
+                result_code_response= self.get_response_data()
+                bytel_html_table = df_resultsbytel.to_html(index=False)
+                sfr_html_table = df_resultssfr.to_html(index=False)
+
+                subject = "[PORTAIL CDR] Synthèse Hebdomadaire du traitement des flux Crozon"
+
+                message_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        h2 {{ color: #0275d8; }}
+        ul {{ list-style-type: none; padding: 0; }}
+        li {{ margin-bottom: 10px; }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        th, td {{
+            border: 1px solid #ccc;
+            padding: 8px;
+            text-align: center;
+        }}
+        th {{
+            background-color: #0275d8;
+        }}
+        .header-row {{
+            background-color: #0275d8;
+            color: white;
+        }}
+        .total-row {{
+            font-weight: bold;
+        }}
+    </style>
+</head>
+<body>
+    <h2>Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</h2>
+    <p>Intervenants: Nokia pour OPM/TFT : Sleiman Fadel</p>
+    <p>Contexte et objectifs : Traitement et analyse des flux Crozon contenant l'état actuel de l'implémentation radio sur l'ensemble des cellules servant à la configuration Crozon.</p>
+    <h3>Observations SFR:</h3>
+    <ul>
+        <li>Sur le code D01 {result_code_response['D01_count_sfr']} cellules (Paramètre obligatoire manquant ; Au moins un des paramètres obligatoires de l’objet n’est pas valorisé ) </li>
+        <li>Pour les {result_code_response['D02_count_sfr']}  cellules avec code D02 « Modèle antenne inconnu; Le modèle d’antenne n’est pas répertorié dans le SI de l’opérateur récepteur ».</li>
+        <li>Sur le code D03 {result_code_response['D03_count_sfr']} cellules.</li>
+        <li>Sur le code D04 {result_code_response['D04_count_sfr']} Valeur hors range ou type incohérent; Au moins un des paramètres de l’objet ne respecte pas les valeurs balises définies ou n’est pas au format attendu)</li>
+        <li>Sur le code D05 {result_code_response['D05_count_sfr']} (Doublon clés- L'identifiant unique de l'objet est en doublon.), cellules avec erreur ID_CELL.</li>
+        <li>Sur le code D06  cellules {result_code_response['D06_count_sfr']}</li>
+    </ul>
+    <h3>Observations DCI:</h3>
+    <ul>
+        <li>Sur le code D01 {result_code_response['D01_count_dci']} cellules.</li>
+        <li>Pour les {result_code_response['D02_count_dci']} cellules avec code D02 Modèle antenne inconnu; Le modèle d'antenne n'est pas répertorié dans le SI de l'opérateur récepteur.</li>
+        <li>Sur le code D03 {result_code_response['D03_count_dci']} cellules.</li>
+        <li>Sur le code D04 {result_code_response['D04_count_dci']} désigne que les valeurs hors range ou type d'incohérence</li>
+        <li>Sur le code D05 {result_code_response['D05_count_dci']} (Doublon clés- L'identifiant unique de l'objet est en doublon.)</li>
+        <li>Sur le code D06 {result_code_response['D06_count_dci']} cellules.</li>
+    </ul>
+<h3>Actions En Cours:</h3>
+ <table>
+        <tr class="header-row">
+            <th>Technologie</th>
+            <th>Volume total</th>
+            <th>Volume Acquitte</th>
+            <th>% Acquitte</th>
+            <th>Volume Bloqué</th>
+            <th>Actions/Porteur</th>
+        </tr>
+        <tr>
+            <td>2G</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL2G']['total_file_code_rows']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL2G']['D00_count']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL2G']['percentage_D00']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL2G']['volume_bloque']}</td>c
+
+            <td>
+                D01 - paramètres obligatoires manquants : BCCH, MSRXMIN --> ces paramètres obligatoires Ne sont pas valorisés<br>
+            </td>
+        </tr>
+        <tr>
+            <td>3G</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL3G']['total_file_code_rows']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL3G']['D00_count']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL3G']['percentage_D00']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL3G']['volume_bloque']}</td> 
+            <td>
+                D01 - paramètres obligatoires manquants : ARFCN_UL  --> ce paramètre obligatoire ne est pas valorisé <br>
+                D02 - modèle antenne inconnu --> paramètres pour lesquels le modèle d’antenne n’est pas répertorié dans le SI de l’opérateur récepteur <br>
+            </td>
+        </tr>
+        <tr>
+            <td>4G</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL4G']['total_file_code_rows']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL4G']['D00_count']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL4G']['percentage_D00']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL4G']['volume_bloque']}</td> 
+            <td>
+                D01 - paramètres obligatoires manquants : ARFCN_DL, MIMO_NB_TX, NB_BLOC_RRS, PUISSANCE_CELL --> ces paramètres obligatoires ne sont pas valorisés<br>
+                D02 - modèle antenne inconnu --> paramètres pour lesquels le modèle d’antenne n’est pas répertorié dans le SI de l’opérateur récepteur<br>
+                D04 - Valeur hors range ou type incohérent --> paramètres ARFCN_DL, ENODEBID, ne respectent pas les valeurs balises définies<br>
+            </td>
+        </tr>
+        <tr>
+            <td>5G</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL5G']['total_file_code_rows']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL5G']['D00_count']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL5G']['percentage_D00']}</td>
+            <td>{resultsfr_response['CZRAN_OAL_CELL5G']['volume_bloque']}</td> 
+            <td>
+                D04 - Valeur hors range ou type incohérent --> paramètres MIMO_NB_TX, ne respectent pas les valeurs balises définies <br>
+                D04 - Valeur hors range ou type incohérent --> paramètres TYPE_SITE, ne respectent pas les valeurs balises définies <br>
+            </td>
+        </tr>
+        <tr class="total-row">
+            <td>Total</td>
+            <td>{resultsfr_response['total_rows']}</td>
+             <td>{resultsfr_response['volume_d00']}</td>
+            <td>{resultsfr_response['percentage_d00']}</td>
+            <td>{resultsfr_response['volume_bloque']}</td>
+            <td></td>
+        </tr>
+    </table>
+     <br>
+     <table>
+        <tr class="header-row">
+            <th>Technologie</th>
+            <th>Volume total</th>
+            <th>Volume Acquis</th>
+            <th>% Acquitte</th>
+            <th>Volume Bloqué</th>
+            <th>Actions/Porteur</th>
+        </tr>
+        <tr>
+            <td>2G</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL2G']['total_file_code_rows']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL2G']['D00_count']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL2G']['percentage_D00']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL2G']['volume_bloque']}</td>
+            <td>
+                D01 - paramètres obligatoires manquants : BANDE_FREQ, HSNA, MOC, MSTXPWR, NB_TX, PUISSANCE_CELL, TYPE_PLANIF --> ces paramètres obligatoires ne sont pas valorisés<br>
+                D02 - modèle antenne inconnu --> paramètre ID_CELL pour lequel le modèle d’antenne n’est pas répertorié dans le SI de l’opérateur récepteur <br>
+            </td>
+        </tr>
+        <tr>
+            <td>3G</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL3G']['total_file_code_rows']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL3G']['D00_count']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL3G']['percentage_D00']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL3G']['volume_bloque']}</td> 
+            <td>
+                D01 - paramètres obligatoires manquants : LARG_BAND_DL, PUISSANCE_CELL, RNCID --> ces paramètres obligatoires ne sont pas valorisés <br>
+                D04 - Valeur hors range ou type incohérent --> paramètre CPICH ne respecte pas les valeurs balises définies<br>
+            </td>
+        </tr>
+        <tr>
+            <td>4G</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL4G']['total_file_code_rows']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL4G']['D00_count']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL4G']['percentage_D00']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL4G']['volume_bloque']}</td> 
+            <td>
+                D01 - paramètres obligatoires manquants : MCC, MIMO_NB_TX, MNC --> ces paramètres obligatoires ne sont pas valorisés<br>
+                D02 - modèle antenne inconnu --> paramètre ID_CELL pour lequel le modèle d’antenne n’est pas répertorié dans le SI de l’opérateur récepteur<br>
+                D04 - Valeur hors range ou type incohérent --> paramètres ARFCN_DL, CELL_RANGE, ENODEBID, RSRPMIN ne respectent pas les valeurs balises définies<br>
+            </td>
+        </tr>
+        <tr>
+            <td>5G</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL5G']['total_file_code_rows']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL5G']['D00_count']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL5G']['percentage_D00']}</td>
+            <td>{resultbytel_response['CZRAN_OAL_CELL5G']['volume_bloque']}</td> 
+            <td>
+                D04 - Valeur hors range ou type incohérent --> paramètres MIMO_NB_TX, ne respectent pas les valeurs balises définies <br>
+            </td>
+        </tr>
+        <tr class="total-row">
+            <td>Total</td>
+            <td>{resultbytel_response['total_rows']}</td>
+            <td>{resultbytel_response['volume_d00']}</td>
+            <td>{resultbytel_response['percentage_d00']}</td>
+            <td>{resultbytel_response['volume_bloque']}</td>
+            <td></td>
+        </tr>
+    </table>
+</body>
+</html>
+"""
+                smtp_server = "172.18.43.44"
+                smtp_port = 25
+                to_email = "elie.saad.ext@nokia.com"
+
+                self.send_email(subject, message_body, to_email, smtp_server, smtp_port, html=True)
+
+                return JsonResponse({'status': 'success'})
+
+            else:
+                return JsonResponse({'status': 'error', 'error': 'Missing file paths in session data'}, status=400)
+
+        except Exception as e:
+            error_message = str(e)
+            return JsonResponse({'status': 'error', 'error': error_message}, status=500)
+
+    def send_email(self, subject, body, to_email, smtp_server, smtp_port, html=False):
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        import smtplib
+
+        message = MIMEMultipart('alternative')
+        message['Subject'] = subject
+        message['To'] = to_email
+        message.attach(MIMEText(body, 'html' if html else 'plain'))
+
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.send_message(message)
+    def get_response_data(self):
+        code_values = ['D01', 'D02', 'D03', 'D04', 'D05', 'D06']
+        response_data = {}
+
+        try:
+            for code in code_values:
+                try:
+                        sfr_count = CellDataSfr.objects.filter(CODE=code).count()
+                        dci_count = CellDataDci.objects.filter(CODE_ACQUITTEMENT=code).count()
+                except ObjectDoesNotExist:
+                        sfr_count = 0
+                        dci_count = 0
+                response_data[f'{code}_count_sfr'] = sfr_count
+                response_data[f'{code}_count_dci'] = dci_count
+                print(response_data[f'{code}_count_sfr'])
+            return response_data
+
+        except DatabaseError as e:
+            error_message = str(e)
+            print(f"DatabaseError in get_response_data: {error_message}")
+            return {}
+
+        except Exception as e:
+            error_message = str(e)
+            print(f"Exception in get_response_data: {error_message}")
+            return {}
+    @staticmethod  
+    def analyze_d00_to_d06_czran_oal_all_bytel(resultsbytel_df):
+        codes = ['D00', 'D01', 'D02', 'D03', 'D04', 'D05', 'D06']
+        file_codes = ['CZRAN_OAL_CELL2G', 'CZRAN_OAL_CELL3G', 'CZRAN_OAL_CELL4G', 'CZRAN_OAL_CELL5G']
+
+        total_rows = len(resultsbytel_df)
+        results = {'total_rows': total_rows, 'volume_bloque': 0, 'percentage_d00': 0, 'volume_d00': 0}
+        global_d00_count = 0
+        for file_code in file_codes:
+                file_code_results = {}
+                filtered_by_file_code_df = resultsbytel_df[resultsbytel_df['CODE_FICHIER'] == file_code]
+                total_file_code_rows = len(filtered_by_file_code_df)
+
+                file_code_results['total_file_code_rows'] = total_file_code_rows
+
+                d00_count = len(filtered_by_file_code_df[filtered_by_file_code_df['CODE_ACQUITTEMENT'] == 'D00'])
+                global_d00_count += d00_count
+                volume_bloque = total_file_code_rows - d00_count
+                file_code_results['volume_bloque'] = volume_bloque
+                
+                for code in codes:
+                        filtered_df = filtered_by_file_code_df[filtered_by_file_code_df['CODE_ACQUITTEMENT'] == code]
+                        count = len(filtered_df)
+
+                        percentage = (count / total_file_code_rows) * 100 if total_file_code_rows > 0 else 0
+                        percentage= round(percentage)
+                        file_code_results[f'{code}_count'] = count
+                        file_code_results[f'percentage_{code}'] = percentage
+
+                results[file_code] = file_code_results
+        global_not_d00_count = total_rows - global_d00_count
+        percentage_d00 = (global_d00_count / total_rows) * 100 if total_rows > 0 else 0
+        percentage_d00 = round(percentage_d00)
+        results['volume_bloque'] = global_not_d00_count
+        results['percentage_d00'] = percentage_d00
+        results['volume_d00']=global_d00_count
+        return results
+
+    @staticmethod
+    def analyze_d00_to_d06_czran_oal_all_sfr(resultssfr_df):
+        codes = ['D00', 'D01', 'D02', 'D03', 'D04', 'D05', 'D06']
+        file_codes = ['CZRAN_OAL_CELL2G', 'CZRAN_OAL_CELL3G', 'CZRAN_OAL_CELL4G', 'CZRAN_OAL_CELL5G']
+
+        total_rows = len(resultssfr_df)
+        results = {'total_rows': total_rows, 'volume_bloque': 0, 'percentage_d00': 0, 'volume_d00':0}
+        global_d00_count = 0
+        for file_code in file_codes:
+                file_code_results = {}
+                filtered_by_file_code_df = resultssfr_df[resultssfr_df['CODE_FICHIER'] == file_code]
+                total_file_code_rows = len(filtered_by_file_code_df)
+
+                file_code_results['total_file_code_rows'] = total_file_code_rows
+
+                d00_count = len(filtered_by_file_code_df[filtered_by_file_code_df['CODE_ACQUITTEMENT'] == 'D00'])
+                global_d00_count += d00_count
+                volume_bloque = total_file_code_rows - d00_count
+                file_code_results['volume_bloque'] = volume_bloque
+
+                for code in codes:
+                        filtered_df = filtered_by_file_code_df[filtered_by_file_code_df['CODE_ACQUITTEMENT'] == code]
+                        count = len(filtered_df)
+
+                        percentage = (count / total_file_code_rows) * 100 if total_file_code_rows > 0 else 0
+                        percentage = round(percentage)
+                        file_code_results[f'{code}_count'] = count
+                        file_code_results[f'percentage_{code}'] = percentage
+
+                results[file_code] = file_code_results
+        global_not_d00_count = total_rows - global_d00_count
+        percentage_d00 = (global_d00_count / total_rows) * 100 if total_rows > 0 else 0
+        percentage_d00= round(percentage_d00)
+        results['volume_bloque'] = global_not_d00_count
+        results['percentage_d00'] = percentage_d00
+        results['volume_d00']=global_d00_count
+        return results 
